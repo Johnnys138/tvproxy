@@ -1,3 +1,49 @@
+Hugging Face's logo
+Hugging Face
+Models
+Datasets
+Spaces
+Posts
+Docs
+Enterprise
+Pricing
+
+
+
+Spaces:
+
+Toastremio
+/
+prx
+
+
+like
+0
+
+Logs
+App
+Files
+Community
+Settings
+prx
+/
+app.py
+
+Toastremio's picture
+Toastremio
+Update app.py
+ddae906
+verified
+less than a minute ago
+raw
+
+Copy download link
+history
+blame
+edit
+delete
+
+16.3 kB
 from flask import Flask, request, Response
 import requests
 from urllib.parse import urlparse, urljoin, quote, unquote
@@ -63,9 +109,10 @@ def resolve_m3u8_link(url, headers=None):
 
                 # Terzo passo (Iframe): Richiesta all'URL dell'iframe
                 # Aggiorna Referer e Origin per la richiesta all'iframe
-                referer_raw = urlparse(url2).scheme + "://" + urlparse(url2).netloc
-                current_headers['Referer'] = url2
-                current_headers['Origin'] = referer_raw
+                referer_raw = urlparse(url2).scheme + "://" + urlparse(url2).netloc + "/"
+                origin_raw = urlparse(url2).scheme + "://" + urlparse(url2).netloc
+                current_headers['Referer'] = referer_raw
+                current_headers['Origin'] = origin_raw
                 print(f"Passo 3 (Iframe): Richiesta a {url2}")
                 response = session.get(url2, headers=current_headers, timeout=10)
                 response.raise_for_status()
@@ -131,7 +178,7 @@ def resolve_m3u8_link(url, headers=None):
                 stream_headers = {
                     'User-Agent': current_headers.get('User-Agent', ''),
                     'Referer': referer_raw,
-                    'Origin': referer_raw
+                    'Origin': origin_raw # Usa origin_raw qui
                 }
                 
                 return {
@@ -180,27 +227,64 @@ def proxy_m3u():
         "Origin": "https://vavoo.to"
     }
 
-    headers = {**default_headers, **{
+    # Estrai gli header dalla richiesta, sovrascrivendo i default
+    request_headers = {
         unquote(key[2:]).replace("_", "-"): unquote(value).strip()
         for key, value in request.args.items()
         if key.lower().startswith("h_")
-    }}
+    }
+    headers = {**default_headers, **request_headers}
+
+    # --- Nuova logica per trasformare l'URL se necessario ---
+    processed_url = m3u_url
+    # Controlla se l'URL termina con /mono.m3u8 e contiene /premiumXXX/
+    # La regex cerca il pattern alla fine della stringa ($)
+    match_premium_m3u8 = re.search(r'/premium(\d+)/mono\.m3u8$', m3u_url)
+
+    if match_premium_m3u8:
+        channel_number = match_premium_m3u8.group(1)
+        transformed_url = f"https://daddylive.dad/embed/stream-{channel_number}.php"
+        print(f"URL {m3u_url} corrisponde al pattern premium. Trasformato in: {transformed_url}")
+        processed_url = transformed_url
+    else:
+        print(f"URL {m3u_url} non corrisponde al pattern premium/mono.m3u8. Utilizzo URL originale.")
+    # --- Fine nuova logica ---
 
     try:
-        response = requests.get(m3u_url, headers=headers, allow_redirects=True)
-        response.raise_for_status()
-        final_url = response.url
-        m3u_content = response.text
+        # Chiama sempre la funzione di risoluzione con l'URL processato (trasformato o originale)
+        print(f"Chiamata a resolve_m3u8_link per URL processato: {processed_url}")
+        result = resolve_m3u8_link(processed_url, headers)
 
+        if not result["resolved_url"]:
+            return "Errore: Impossibile risolvere l'URL in un M3U8 valido.", 500
+
+        resolved_url = result["resolved_url"]
+        current_headers_for_proxy = result["headers"] # Usa gli header dalla risoluzione
+
+        print(f"Risoluzione completata. URL M3U8 finale: {resolved_url}")
+
+        # Fetchare il contenuto M3U8 effettivo dall'URL risolto
+        print(f"Fetching M3U8 content from resolved URL: {resolved_url}")
+        m3u_response = requests.get(resolved_url, headers=current_headers_for_proxy, allow_redirects=True, timeout=10)
+        m3u_response.raise_for_status()
+        m3u_content = m3u_response.text
+        final_url = m3u_response.url # Aggiorna final_url all'URL M3U8 effettivo
+
+        # Ora processa il contenuto M3U8 (sempre risolto)
         file_type = detect_m3u_type(m3u_content)
 
         if file_type == "m3u":
+            # Gestisci playlist M3U (non stream M3U8)
             return Response(m3u_content, content_type="audio/x-mpegurl")
 
+        # Processa contenuto M3U8
         parsed_url = urlparse(final_url)
+        # Determina l'URL base per i percorsi relativi nell'M3U8
+        # Usa la directory dell'URL M3U8 finale
         base_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path.rsplit('/', 1)[0]}/"
 
-        headers_query = "&".join([f"h_{quote(k)}={quote(v)}" for k, v in headers.items()])
+        # Prepara la query degli header per segmenti/chiavi proxati
+        headers_query = "&".join([f"h_{quote(k)}={quote(v)}" for k, v in current_headers_for_proxy.items()])
 
         modified_m3u8 = []
         for line in m3u_content.splitlines():
@@ -208,6 +292,7 @@ def proxy_m3u():
             if line.startswith("#EXT-X-KEY") and 'URI="' in line:
                 line = replace_key_uri(line, headers_query)
             elif line and not line.startswith("#"):
+                # Gestisci URL di segmenti relativi e assoluti
                 segment_url = urljoin(base_url, line)
                 line = f"/proxy/ts?url={quote(segment_url)}&{headers_query}"
             modified_m3u8.append(line)
@@ -217,7 +302,13 @@ def proxy_m3u():
         return Response(modified_m3u8_content, content_type="application/vnd.apple.mpegurl")
 
     except requests.RequestException as e:
-        return f"Errore durante il download del file M3U/M3U8: {str(e)}", 500
+        print(f"Errore durante il download o la risoluzione del file: {str(e)}")
+        print(f"Dettagli errore: {traceback.format_exc()}")
+        return f"Errore durante il download o la risoluzione del file M3U/M3U8: {str(e)}", 500
+    except Exception as e:
+        print(f"Errore generico nella funzione proxy_m3u: {str(e)}")
+        print(f"Dettagli errore: {traceback.format_exc()}")
+        return f"Errore generico durante l'elaborazione: {str(e)}", 500
 
 @app.route('/proxy/resolve')
 def proxy_resolve():
